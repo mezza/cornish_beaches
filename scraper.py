@@ -20,6 +20,7 @@ import csv
 import json
 import re
 import argparse
+import urllib.parse
 from dataclasses import dataclass
 from typing import Optional
 
@@ -34,6 +35,7 @@ from openai import OpenAI
 
 BASE_URL    = "https://www.visitcornwall.com"
 BEACHES_URL = "https://www.visitcornwall.com/things-to-do/beaches"
+COUNCIL_RESTRICTIONS_URL = "https://www.cornwall.gov.uk/environment/animal-welfare-and-enforcement/dogs-on-beaches/"
 
 DEFAULT_MODEL   = "prism-ml/Ternary-Bonsai-8B-mlx-2bit"
 DEFAULT_API_URL = "http://127.0.0.1:8080/v1"
@@ -58,7 +60,7 @@ RULES:
   return them as 'lat,lng'. Otherwise return the most specific address or postcode
   you can find in the text. Return null if no location information is present.
 
-- notes: extract FULL SPECIFIC DETAIL — do not summarise or paraphrase.
+- notes: extract SUMMARISED DETAIL - try to keep within 40 words.
   Always preserve: exact dates (e.g. '1 May to 30 September'), exact times
   (e.g. '10am to 6pm'), and any named areas the restriction applies to.
   If both dog restrictions and cafe information are present, include both.
@@ -223,6 +225,50 @@ def clean_text(html: str, max_chars: int = 5000) -> str:
     return text[:max_chars]
 
 
+# ---------------------------------------------------------------------------
+# Step 3: Cornwall Council dog-restriction tables
+# ---------------------------------------------------------------------------
+
+def normalize_name(name: str) -> str:
+    """Lowercase, strip non-alphanumeric — used for fuzzy beach name matching."""
+    return re.sub(r'[^a-z0-9]', '', name.lower())
+
+
+async def fetch_council_restrictions(http_client: httpx.AsyncClient) -> list[dict]:
+    """
+    Scrape the Cornwall Council dog-restrictions page.
+    Both <table> elements share the same three-column structure:
+      col 0 — beach name (with optional PDF link)
+      col 1 — dates restrictions apply
+      col 2 — times restrictions apply
+    Returns a flat list of {name, dates, times} dicts.
+    """
+    r = await http_client.get(COUNCIL_RESTRICTIONS_URL)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "lxml")
+
+    entries = []
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr")[1:]:  # skip header row
+            cells = row.find_all(["td", "th"])
+            if len(cells) < 3:
+                continue
+            name  = ' '.join(cells[0].find_all(string=True, recursive=False)).strip()
+            dates = cells[1].get_text(strip=True)
+            times = cells[2].get_text(strip=True)
+            if name:
+                entries.append({"name": name, "dates": dates, "times": times})
+
+    return entries
+
+
+async def geocode_by_name(pw_page: Page, name: str) -> Optional[str]:
+    """Search Google Maps for '{name}, Cornwall' and extract lat,lng from the redirect."""
+    query    = urllib.parse.quote_plus(f"{name}, Cornwall")
+    maps_url = f"https://www.google.com/maps/search/{query}"
+    return await extract_coords_from_maps(pw_page, maps_url)
+
+
 async def enrich_beach(
     beach: Beach,
     pw_page: Page,
@@ -346,7 +392,56 @@ async def run(model: str, api_base: str, output_file: str, delay: float):
 
         await browser.close()
 
-    # Phase 3: Write CSV
+    # Phase 3: Merge Cornwall Council dog-restriction data
+    print("\n[Phase 3] Fetching Cornwall Council beach restrictions...")
+    async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=30) as http_client:
+        restrictions = await fetch_council_restrictions(http_client)
+    print(f"  Found {len(restrictions)} restricted beaches")
+
+    # Build a normalised-name → list-index lookup for fast matching
+    beach_index: dict[str, int] = {normalize_name(b.title): i for i, b in enumerate(beaches)}
+
+    unmatched = []  # council entries with no corresponding VisitCornwall beach
+    for entry in restrictions:
+        note = f"Dog restrictions: {entry['dates']}, {entry['times']}"
+        norm = normalize_name(entry["name"])
+        if norm in beach_index:
+            b = beaches[beach_index[norm]]
+            b.dog_friendly = "Seasonal"
+            b.notes = f"{b.notes}; {note}" if b.notes else note
+            print(f"  Matched: {entry['name']}")
+        else:
+            unmatched.append(entry)
+            print(f"  New beach (council only): {entry['name']}")
+
+    if unmatched:
+        print(f"\n  Geocoding {len(unmatched)} council-only beaches via Google Maps...")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            ctx     = await browser.new_context(
+                user_agent=HEADERS["User-Agent"],
+                extra_http_headers={"Accept-Language": HEADERS["Accept-Language"]},
+            )
+            pw_page = await ctx.new_page()
+
+            for entry in unmatched:
+                print(f"  Geocoding: {entry['name']}")
+                coords = await geocode_by_name(pw_page, entry["name"])
+                if coords:
+                    print(f"    → {coords}")
+                note = f"Dog restrictions: {entry['dates']}, {entry['times']}"
+                beaches.append(Beach(
+                    title        = entry["name"],
+                    dog_friendly = "Seasonal",
+                    notes        = note,
+                    location     = coords,
+                    url          = COUNCIL_RESTRICTIONS_URL,
+                ))
+                await asyncio.sleep(delay)
+
+            await browser.close()
+
+    # Phase 4: Write CSV
     fieldnames = ["beach_name", "location", "dog_friendly", "cafe", "notes", "url"]
     with open(output_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
