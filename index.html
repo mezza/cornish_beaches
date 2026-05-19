@@ -386,6 +386,23 @@
                 left: 7px;
             }
 
+            /* ── Locate-me control ── */
+            .locate-btn {
+                width: 30px;
+                height: 30px;
+                background: var(--white);
+                border: 2px solid rgba(0,0,0,0.2);
+                border-radius: 4px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                box-shadow: none;
+                padding: 0;
+            }
+            .locate-btn:hover { background: #f4f4f4; }
+            .locate-btn svg { display: block; }
+
             /* ── Toast / empty state ── */
             #toast {
                 position: fixed;
@@ -494,6 +511,36 @@
 
             // Move zoom control to bottom-right so it doesn't clash with the header
             map.zoomControl.setPosition("bottomright");
+
+            // ── Locate-me control ─────────────────────────
+            L.Control.Locate = L.Control.extend({
+                onAdd() {
+                    const btn = L.DomUtil.create("button", "locate-btn");
+                    btn.title = "Go to my location";
+                    btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
+                        fill="none" stroke="#333" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <circle cx="12" cy="12" r="3"/>
+                        <line x1="12" y1="2" x2="12" y2="6"/>
+                        <line x1="12" y1="18" x2="12" y2="22"/>
+                        <line x1="2" y1="12" x2="6" y2="12"/>
+                        <line x1="18" y1="12" x2="22" y2="12"/>
+                    </svg>`;
+                    L.DomEvent.on(btn, "click", L.DomEvent.stopPropagation);
+                    L.DomEvent.on(btn, "click", () => {
+                        if (!navigator.geolocation) {
+                            showToast("Geolocation not supported by your browser");
+                            return;
+                        }
+                        navigator.geolocation.getCurrentPosition(
+                            ({ coords }) => map.setView([coords.latitude, coords.longitude], 14),
+                            () => showToast("Could not get your location"),
+                        );
+                    });
+                    return btn;
+                },
+                onRemove() {},
+            });
+            new L.Control.Locate({ position: "bottomright" }).addTo(map);
 
             // ── Marker colours ────────────────────────────
             const COLOURS = {
